@@ -5,7 +5,7 @@ from loss.arcface import ArcFace
 
 
 def weights_init_kaiming(m):
-    classname = m.__class__.__name__
+    classname = m.__class__.__name__  # 获取类名
     if classname.find('Linear') != -1:
         nn.init.kaiming_normal_(m.weight, a=0, model='fan_out')
         nn.init.constant_(m.bias, 0.0)
@@ -26,7 +26,6 @@ def weights_init_classifier(m):
         nn.init.normal_(m.weight, std=0.001)
         if m.bias:
             nn.init.constant_(m.bias, 0.0)
-
 
 class Backbone(nn.Module):
     def __init__(self, num_classes, cfg):
@@ -49,47 +48,53 @@ class Backbone(nn.Module):
             self.base.load_param(model_path)
             print('Loading pretrained ImageNet model......')
 
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.gap = nn.AdaptiveAvgPool2d(1)
         self.num_classes = num_classes
 
         if self.cos_layer:
             print('using cosine layer')
             self.arcface = ArcFace(self.in_planes, self.num_classes, s=30.0, m=0.50)
         else:
-            # self.classifier = nn.Linear(self.in_planes, self.num_classes, bias=False)
-            # self.classifier.apply(weights_init_classifier)
-            self.fc = nn.Sequential(
-                nn.Dropout(0.5),
-                nn.Linear(self.in_planes, self.num_classes)
-            )
+            self.classifier = nn.Linear(self.in_planes, self.num_classes, bias=False)
+            self.classifier.apply(weights_init_classifier)
 
         self.bottleneck = nn.BatchNorm1d(self.in_planes)
         self.bottleneck.bias.requires_grad_(False)
-        self.bottleneck.apply(weights_init_kaiming)
-        self.reduce_layer = nn.Conv2d(4096, 2048, 1)
+        self.bottleneck.apply(weights_init_kaiming)  # apply(func)
+        self.bn = nn.BatchNorm2d(2048)
+        self.relu = nn.ReLU(inplace=True)
 
-    def forward(self, x, label=None): # label is unused if self.cos_layer == 'no'
-        bs = x.shape[0]
+
+    def forward(self, x, label=None):  # label is unused if self.cos_layer == 'no'
         x = self.base(x)
-        # global_feat = nn.functional.avg_pool2d(x, x.shape[2:4])
-        # global_feat = global_feat.view(global_feat.shape[0], -1)  # flatten to (bs, 2048)
+        lf = self.bn(x)
+        lf = self.relu(lf)
+        lf = nn.functional.avg_pool2d(lf, (8, 8))
 
-        x1 = self.avg_pool(x).view(bs, -1)
-        x2 = self.max_pool(x).view(bs, -1)
-        x1 = self.avg_pool(x)
-        x2 = self.max_pool(x)
-        global_feat = torch.cat([x1, x2], dim=1)
-        global_feat = self.reduce_layer(global_feat).view(bs, -1)#max pooling更加关注重要的局部特征，而average pooling试更加关注全局的特征
+        lf1 = lf[:, :, 0:1, :]
+        lf2 = lf[:, :, 1:2, :]
+
+
+        lf1 = lf1.squeeze(dim=3).squeeze(dim=2)
+        lf1 = self.bottleneck(lf1)
+        lf1_score = self.classifier(lf1)
+
+        lf2 = lf2.squeeze(dim=3).squeeze(dim=2)
+        lf2 = self.bottleneck(lf2)
+        lf2_score = self.classifier(lf2)
+
+        global_feat = nn.functional.avg_pool2d(x, x.shape[2:4])
+        global_feat = global_feat.view(global_feat.shape[0], -1)  # flatten to (bs, 2048)
 
         feat = self.bottleneck(global_feat)
+
 
         if self.training:
             if self.cos_layer:
                 cls_score = self.arcface(feat, label)
             else:
-                cls_score = self.fc(feat)
-            return cls_score, global_feat  # global feature for triplet loss
+                cls_score = self.classifier(feat)
+            return cls_score, lf1_score, lf2_score, global_feat  # global feature for triplet loss. cls_score的shape是[batch_size,num_class],global_feat的shape是[batch_size,2048],lf的shape是[batch_size,128,height/16,1]
         else:
             return feat
 
@@ -105,3 +110,5 @@ class Backbone(nn.Module):
 def make_model(cfg, num_class):
     model = Backbone(num_class, cfg)
     return model
+
+
